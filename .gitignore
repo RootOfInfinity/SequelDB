@@ -1,4 +1,4 @@
 /target
-./flake.lock
-./.nix-develop-cache
-./.nix-develop-cache-1-link
+flake.lock
+.nix-develop-cache
+.nix-develop-cache-1-link
