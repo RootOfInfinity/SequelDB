@@ -1,3 +1,4 @@
 /target
 flake.lock
-\.nix-develop-cache*
+\.nix-develop-cache
+\.nix-develop-cache-1-link
