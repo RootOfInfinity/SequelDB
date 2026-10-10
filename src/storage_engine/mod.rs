@@ -3,6 +3,7 @@ mod concurrency_control;
 mod db_errors;
 mod db_tests;
 mod disk_io;
+mod memtable;
 mod page_cache;
 mod parallel_work_runner;
 mod recovery_manager;

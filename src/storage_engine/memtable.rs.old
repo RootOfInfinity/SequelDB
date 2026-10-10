@@ -1,0 +1,102 @@
+use std::sync::{Arc, RwLock};
+
+const LEAF_FANOUT_SIZE: usize = 8;
+const NONLEAF_FANOUT_SIZE: usize = 16;
+
+type DataValue = Vec<u8>;
+
+/// TODO: Be more specific with pub to make things more clear
+/// This is optimized for concurrent in-memory B+-Tree storage.
+pub enum MemNode {
+    Leaf(Arc<RwLock<LeafNode>>),
+    NonLeaf(Arc<RwLock<NonLeafNode>>),
+}
+
+pub struct LeafNode {
+    pub values: [(u64, DataValue); LEAF_FANOUT_SIZE],
+}
+
+pub struct NonLeafNode {
+    pub keys: [u64; NONLEAF_FANOUT_SIZE - 1],
+    pub nodes: [Option<Arc<MemNode>>; NONLEAF_FANOUT_SIZE],
+}
+
+pub fn find_node_where_key_is(key: u64, node: Arc<MemNode>) -> Arc<RwLock<LeafNode>> {
+    match &*node {
+        MemNode::Leaf(leaf) => return Arc::clone(&leaf),
+        MemNode::NonLeaf(nonleaf) => {
+            // TODO: Fix this unwrap thing.
+            let read_lock = nonleaf.read().unwrap();
+            let next_node_ind = binary_search_node_in_nonleaf(key, &read_lock.keys);
+
+            let next_node_clone = Arc::clone(read_lock.nodes[next_node_ind]);
+            drop(read_lock);
+            return find_node_where_key_is(key, next_node_clone);
+        }
+    }
+}
+
+pub fn read_value(key: u64, node: &LeafNode) -> Option<&DataValue> {
+    match binary_search(key, &node.values) {
+        Some(index) => {
+            return Some(&node.values[index].1);
+        }
+        None => None,
+    }
+}
+
+pub fn apply_closure_to_val<F, V>(key: u64, node: Arc<MemNode>, closure: F) -> Option<()>
+where
+    F: Fn(&DataValue) -> DataValue,
+{
+    let leaf = find_node_where_key_is(key, node);
+    // TODO: Fix this unwrap thing.
+    let mut leaf_lock = leaf.write().unwrap();
+    match binary_search(key, &leaf_lock.values) {
+        Some(index) => {
+            let value = &mut leaf_lock.values[index].1;
+            *value = closure(&value);
+            Some(())
+        }
+        None => return None,
+    }
+}
+
+fn binary_search_node_in_nonleaf<T>(key: u64, key_list: &[u64]) -> usize {
+    let mut min = 0;
+    let mut max = key_list.len() / 2;
+    let mut mid = (min + max) / 2;
+    for _ in 0..(key_list.len().ilog2() + 1) {
+        if key_list[mid] == key {
+            return mid + 1;
+        } else if key_list[mid] > key {
+            min = mid;
+            mid = (min + max) / 2;
+        } else if key_list[mid] < key {
+            max = mid;
+            mid = (min + max) / 2;
+        }
+    }
+    if mid == 0 && key < key_list[mid] {
+        return 0;
+    }
+    return mid;
+}
+
+fn binary_search<T>(key: u64, list: &[(u64, T)]) -> Option<usize> {
+    let mut min = 0;
+    let mut max = list.len() / 2;
+    let mut mid = (min + max) / 2;
+    for _ in 0..list.len().ilog2() {
+        if list[mid].0 == key {
+            return Some(mid);
+        } else if list[mid].0 > key {
+            min = mid;
+            mid = (min + max) / 2;
+        } else if list[mid].0 < key {
+            max = mid;
+            mid = (min + max) / 2;
+        }
+    }
+    None
+}
