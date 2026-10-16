@@ -12,7 +12,7 @@ type Key = u64;
 const NULL_DATA_VALUE: DataValue = Vec::new();
 type DataValue = Vec<u8>;
 
-const MAX_LEVEL: u8 = 14;
+const MAX_LEN: u8 = 15;
 
 /// This is the node datatype used internally for creating skiplists.
 /// The level of the node is determined by the length of the vec.
@@ -27,6 +27,7 @@ pub struct SkipListNode {
 /// Epitaph represents whether a value exists (Alive) or doesn't (Tombstone).
 /// The name of the enum comes from my computer science teacher, and exists as a joke
 /// in the internal memtable file.
+#[derive(Clone)]
 enum Epitaph {
     Alive(DataValue),
     Tombstone,
@@ -37,11 +38,8 @@ enum Epitaph {
 /// information about what the predecessors would be if it existed.
 /// Perhaps the name 'Before' doesn't fit the enum anymore.
 enum KeyLocation {
-    Exact(
-        Arc<RwLock<SkipListNode>>,
-        [Arc<RwLock<SkipListNode>>; MAX_LEVEL as usize],
-    ),
-    Before([Arc<RwLock<SkipListNode>>; MAX_LEVEL as usize]),
+    Exact(Arc<RwLock<SkipListNode>>),
+    Before([Arc<RwLock<SkipListNode>>; MAX_LEN as usize]),
 }
 
 // Public API for using the Skip List.
@@ -51,15 +49,12 @@ enum KeyLocation {
 /// if the list is no longer referenced, it will be deleted from RAM.
 /// You should not use key 0 in the list, as the skiplist uses key 0 for the first node.
 pub fn create_new_list() -> Arc<RwLock<SkipListNode>> {
-    let mut skip_list_start = SkipListNode {
+    let skip_list_start = SkipListNode {
         key: NULL_KEY,
         value: Epitaph::Alive(NULL_DATA_VALUE),
-        pointers: Vec::with_capacity(MAX_LEVEL as usize),
+        pointers: (0..MAX_LEN).into_iter().map(|_| None).collect(),
         deleted: false,
     };
-    for i in 0..(MAX_LEVEL as usize) {
-        skip_list_start.pointers[i] = None;
-    }
     Arc::new(RwLock::new(skip_list_start))
 }
 
@@ -72,7 +67,7 @@ pub fn get_value(key: Key, start_node: Arc<RwLock<SkipListNode>>) -> Option<Data
     let key_location =
         search_for_item_or_predecessors(key, start_node, std::array::from_fn(|_| None));
     match key_location {
-        KeyLocation::Exact(node, _) => {
+        KeyLocation::Exact(node) => {
             let read_latch = node.read().unwrap();
             // if some thread deletes the item, we shouldn't return it,
             // and if it is now created, the transaction manager should deal with it.
@@ -114,9 +109,9 @@ pub fn delete_value(
             std::array::from_fn(|_| None),
         );
         match key_location {
-            KeyLocation::Exact(node, predecessors) => {
+            KeyLocation::Exact(node) => {
                 let level = node.read().unwrap().pointers.len() - 1;
-                delete_node(node, key, level, predecessors, start_node);
+                delete_node(node, key, level, start_node);
                 return Some(());
             }
             _ => return None,
@@ -135,14 +130,10 @@ pub fn delete_value(
 fn search_for_item_or_predecessors(
     key: Key,
     start_node: Arc<RwLock<SkipListNode>>,
-    mut possible_predecessors_by_level: [Option<Arc<RwLock<SkipListNode>>>; MAX_LEVEL as usize],
+    mut possible_predecessors_by_level: [Option<Arc<RwLock<SkipListNode>>>; MAX_LEN as usize],
 ) -> KeyLocation {
-    // TODO: Special case if it's the last node
     // Unwrap if the other threads panic.
     let read_start = start_node.read().unwrap();
-    // if read_start.key == key {
-    //     return KeyLocation::Exact(Arc::clone(&start_node));
-    // }
     // Add self to metadata
     let level = read_start.pointers.len() - 1;
     possible_predecessors_by_level[level] = Some(Arc::clone(&start_node));
@@ -153,8 +144,7 @@ fn search_for_item_or_predecessors(
         if let Some(node) = node_option {
             let new_node_read = node.read().unwrap();
             if new_node_read.key == key && !new_node_read.deleted {
-                let new_predecessors = refine_predecessors(possible_predecessors_by_level);
-                return KeyLocation::Exact(Arc::clone(&node), new_predecessors);
+                return KeyLocation::Exact(Arc::clone(&node));
             } else if new_node_read.key < key {
                 next_node = Some(Arc::clone(&node));
                 break;
@@ -167,12 +157,6 @@ fn search_for_item_or_predecessors(
             search_for_item_or_predecessors(key, next_node, possible_predecessors_by_level)
         }
         None => {
-            for i in (1..possible_predecessors_by_level.len()).into_iter().rev() {
-                if let None = possible_predecessors_by_level[i - 1] {
-                    possible_predecessors_by_level[i - 1] =
-                        possible_predecessors_by_level[i].clone();
-                }
-            }
             let new_predecessors = refine_predecessors(possible_predecessors_by_level);
             KeyLocation::Before(new_predecessors)
         }
@@ -188,59 +172,65 @@ fn search_for_item_or_predecessors(
 /// You can use this function to insert a tombstone value for a key.
 /// Research and testing will show if this has the possiblility for deadlocks.
 fn insert_item(key: Key, value: Epitaph, start_node: Arc<RwLock<SkipListNode>>) {
-    let key_location = search_for_item_or_predecessors(
-        key,
-        Arc::clone(&start_node),
-        std::array::from_fn(|_| None),
-    );
-    match key_location {
-        KeyLocation::Exact(node, _) => {
-            let mut write_lock = node.write().unwrap();
-            write_lock.value = value;
-        }
-        KeyLocation::Before(mut possibles) => {
-            let level = skip_level() as usize;
-            let mut latch_vec: Vec<std::sync::RwLockWriteGuard<'_, SkipListNode>> = (0..=level)
-                .map(|index| possibles[index].write().unwrap())
-                .collect();
-            // make sure predecessors aren't deleted
-            while {
-                let mut at_least_one_deleted = false;
-                for w_latch in &latch_vec[..] {
+    loop {
+        let key_location = search_for_item_or_predecessors(
+            key,
+            Arc::clone(&start_node),
+            std::array::from_fn(|_| None),
+        );
+        match key_location {
+            KeyLocation::Exact(node) => {
+                let mut write_lock = node.write().unwrap();
+                write_lock.value = value;
+                break;
+            }
+            KeyLocation::Before(mut possibles) => {
+                let level = skip_level() as usize;
+
+                let new_node = Arc::new(RwLock::new(SkipListNode {
+                    key,
+                    value: value.clone(),
+                    pointers: Vec::with_capacity(level + 1),
+                    deleted: false,
+                }));
+                let mut all_ptrs_vec = Vec::new();
+                // let mut no_deletions_behind = true;
+                // let mut no_deletions_front = true;
+                let mut stopped_at: Option<usize> = None;
+                for i in 0..=level {
+                    let mut w_latch = possibles[i].write().unwrap();
+                    all_ptrs_vec.push(w_latch.pointers[i].clone());
+                    if let Some(ref read_latch) = all_ptrs_vec[i] {
+                        if read_latch.read().unwrap().deleted {
+                            // no_deletions_front = false;
+                            stopped_at = Some(i);
+                            break;
+                        }
+                    }
+                    new_node
+                        .write()
+                        .unwrap()
+                        .pointers
+                        .push(all_ptrs_vec[i].clone());
+
                     if w_latch.deleted {
-                        at_least_one_deleted = true;
+                        // no_deletions_behind = false;
+                        stopped_at = Some(i);
+                        break;
+                    } else {
+                        w_latch.pointers[i] = Some(Arc::clone(&new_node));
                     }
                 }
-                at_least_one_deleted
-            } {
-                drop(latch_vec);
-                let key_location = search_for_item_or_predecessors(
-                    key,
-                    Arc::clone(&start_node),
-                    std::array::from_fn(|_| None),
-                );
-                possibles = match key_location {
-                    KeyLocation::Exact(_, x) => x,
-                    KeyLocation::Before(x) => x,
-                };
-                latch_vec = (0..=level)
-                    .map(|index| possibles[index].write().unwrap())
-                    .collect();
+                if let Some(x) = stopped_at {
+                    for i in 0..x {
+                        let mut w_latch = possibles[i].write().unwrap();
+                        w_latch.pointers[i] = all_ptrs_vec[i].clone();
+                    }
+                    continue;
+                } else {
+                    break;
+                }
             }
-
-            let new_pointers = (0..=latch_vec.len())
-                .map(|index| latch_vec[index].pointers[index].clone())
-                .collect();
-            let new_node = Arc::new(RwLock::new(SkipListNode {
-                key,
-                value,
-                pointers: new_pointers,
-                deleted: false,
-            }));
-            for (i, latch) in latch_vec.iter_mut().enumerate() {
-                latch.pointers[i] = Some(Arc::clone(&new_node));
-            }
-            drop(latch_vec);
         }
     }
 }
@@ -253,42 +243,57 @@ fn delete_node(
     node_to_kill: Arc<RwLock<SkipListNode>>,
     key: Key,
     level: usize,
-    mut predecessors_by_level: [Arc<RwLock<SkipListNode>>; MAX_LEVEL as usize],
+    // mut predecessors_by_level: [Arc<RwLock<SkipListNode>>; MAX_LEN as usize],
     start_node: Arc<RwLock<SkipListNode>>,
 ) {
-    let mut predesessor_write_latch_vec: Vec<std::sync::RwLockWriteGuard<'_, SkipListNode>> = (0
-        ..=level)
-        .map(|index| predecessors_by_level[index].write().unwrap())
-        .collect();
+    node_to_kill.write().unwrap().deleted = true;
+    let key_location = search_for_item_or_predecessors(
+        key,
+        Arc::clone(&start_node),
+        std::array::from_fn(|_| None),
+    );
+    let KeyLocation::Before(mut predecessors_by_level) = key_location else {
+        panic!(
+            "Programming error, should not be able to insert where it would have a deleted node as a child"
+        );
+    };
 
-    // to make sure we don't have predecessors that are deleted
-    while {
-        let mut at_least_one_deleted = false;
-        for w_latch in &predesessor_write_latch_vec[..] {
+    loop {
+        let mut no_deletions = true;
+        for i in 0..=level {
+            let mut w_latch = predecessors_by_level[i].write().unwrap();
             if w_latch.deleted {
-                at_least_one_deleted = true;
+                no_deletions = false;
+            } else {
+                w_latch.pointers[i] = node_to_kill.read().unwrap().pointers[i].clone();
             }
         }
-        at_least_one_deleted
-    } {
-        drop(predesessor_write_latch_vec);
-        let key_location = search_for_item_or_predecessors(
-            key,
-            Arc::clone(&start_node),
-            std::array::from_fn(|_| None),
-        );
-        predecessors_by_level = match key_location {
-            KeyLocation::Exact(_, x) => x,
-            KeyLocation::Before(x) => x,
-        };
-        predesessor_write_latch_vec = (0..=level)
-            .map(|index| predecessors_by_level[index].write().unwrap())
-            .collect();
-    }
-    let mut write_latch = node_to_kill.write().unwrap();
-    write_latch.deleted = true;
-    for (i, w_latch) in predesessor_write_latch_vec.iter_mut().enumerate() {
-        w_latch.pointers[i] = write_latch.pointers[i].clone();
+        if no_deletions {
+            break;
+        } else {
+            // revert everything
+            for i in 0..=level {
+                let mut w_latch = predecessors_by_level[i].write().unwrap();
+                w_latch.pointers[i] = Some(Arc::clone(&node_to_kill));
+            }
+            // get a new predecessor set
+            let key_location = search_for_item_or_predecessors(
+                key,
+                Arc::clone(&start_node),
+                std::array::from_fn(|_| None),
+            );
+            match key_location {
+                KeyLocation::Exact(_) => {
+                    panic!(
+                        "Deletion and Insertion on the same key can't happen at once, fix transaction manager"
+                    );
+                }
+                KeyLocation::Before(x) => {
+                    predecessors_by_level = x;
+                    continue;
+                }
+            }
+        }
     }
 }
 
@@ -301,16 +306,29 @@ fn delete_node(
 /// None, in which it does the next, and so on.
 /// This is so that we don't have to handle the errors in later manipulation of the predecessors.
 fn refine_predecessors(
-    possible_predecessors_by_level: [Option<Arc<RwLock<SkipListNode>>>; MAX_LEVEL as usize],
-) -> [Arc<RwLock<SkipListNode>>; MAX_LEVEL as usize] {
-    let new_predecessors: [Arc<RwLock<SkipListNode>>; MAX_LEVEL as usize] =
+    mut possible_predecessors_by_level: [Option<Arc<RwLock<SkipListNode>>>; MAX_LEN as usize],
+) -> [Arc<RwLock<SkipListNode>>; MAX_LEN as usize] {
+    let new_predecessors: [Arc<RwLock<SkipListNode>>; MAX_LEN as usize] = {
+        for i in (0..possible_predecessors_by_level.len() - 1)
+            .into_iter()
+            .rev()
+        {
+            if let None = possible_predecessors_by_level[i] {
+                if let Some(ref x) = possible_predecessors_by_level[i + 1] {
+                    possible_predecessors_by_level[i] = Some(Arc::clone(&x));
+                } else {
+                    panic!("Programming error, should never fail here");
+                }
+            }
+        }
         std::array::from_fn(|i| {
             if let Some(ref val_ref) = possible_predecessors_by_level[i] {
                 Arc::clone(val_ref)
             } else {
                 panic!("Programming error, should never fail here");
             }
-        });
+        })
+    };
     new_predecessors
 }
 
@@ -340,5 +358,256 @@ fn skip_level() -> u8 {
         4095..8193 => 2,
         8193..16387 => 1,
         16387.. => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_one_get_one() {
+        let start_node = create_new_list();
+        insert_value(5, vec![3, 2, 4], Arc::clone(&start_node));
+        assert_eq!(vec![3, 2, 4], get_value(5, start_node).unwrap());
+    }
+
+    #[test]
+    fn insert_one_to_hundred_and_get_value() {
+        let start_node = insert_one_to_hundred();
+        let result_val = get_value(56, start_node).unwrap();
+        assert_eq!(
+            ((56 as u8)..105).into_iter().collect::<Vec<u8>>(),
+            result_val
+        );
+    }
+
+    #[test]
+    fn insert_one_to_hundred_and_delete_one() {
+        let start_node = insert_one_to_hundred();
+        delete_value(56, Arc::clone(&start_node), false);
+        let result_val = get_value(56, start_node);
+        assert_eq!(None, result_val);
+    }
+
+    #[test]
+    fn insert_one_to_hundred_and_delete_two() {
+        let start_node = insert_one_to_hundred();
+        delete_value(56, Arc::clone(&start_node), false);
+        let result_val = get_value(56, Arc::clone(&start_node));
+        assert_eq!(None, result_val);
+        delete_value(72, Arc::clone(&start_node), false);
+        let result_val = get_value(72, start_node);
+        assert_eq!(None, result_val);
+    }
+
+    #[test]
+    fn insert_one_to_hundred_and_delete_half() {
+        let start_node = insert_one_to_hundred();
+        for i in 25..=75 {
+            delete_value(i, Arc::clone(&start_node), false);
+        }
+    }
+
+    #[test]
+    fn insert_one_to_hundred_and_tombstone_ascending_vals() {
+        let start_node = insert_one_to_hundred();
+
+        delete_value(50, Arc::clone(&start_node), true);
+        let result_val = get_value(50, Arc::clone(&start_node));
+        assert_eq!(None, result_val);
+        delete_value(51, Arc::clone(&start_node), true);
+        let result_val = get_value(51, Arc::clone(&start_node));
+        assert_eq!(None, result_val);
+    }
+
+    #[test]
+    fn insert_one_to_hundred_and_delete_acsending_vals() {
+        let start_node = insert_one_to_hundred();
+
+        delete_value(50, Arc::clone(&start_node), false);
+        let result_val = get_value(50, Arc::clone(&start_node));
+        assert_eq!(None, result_val);
+        delete_value(51, Arc::clone(&start_node), false);
+        let result_val = get_value(51, Arc::clone(&start_node));
+        assert_eq!(None, result_val);
+    }
+
+    #[test]
+    fn insert_one_to_hundred_delete_half_and_search() {
+        let start_node = insert_one_to_hundred();
+        for i in 25..=75 {
+            delete_value(i, Arc::clone(&start_node), false);
+        }
+        let result_val = get_value(78, Arc::clone(&start_node)).unwrap();
+        assert_eq!(
+            ((78 as u8)..105).into_iter().collect::<Vec<u8>>(),
+            result_val
+        );
+        let result_val = get_value(11, Arc::clone(&start_node)).unwrap();
+        assert_eq!(
+            ((11 as u8)..105).into_iter().collect::<Vec<u8>>(),
+            result_val
+        );
+        let result_val = get_value(92, Arc::clone(&start_node)).unwrap();
+        assert_eq!(
+            ((92 as u8)..105).into_iter().collect::<Vec<u8>>(),
+            result_val
+        );
+        let result_val = get_value(17, Arc::clone(&start_node)).unwrap();
+        assert_eq!(
+            ((17 as u8)..105).into_iter().collect::<Vec<u8>>(),
+            result_val
+        );
+        let result_val = get_value(50, start_node);
+        assert_eq!(None, result_val);
+    }
+
+    #[test]
+    fn insert_one_to_hundred_delete_half_check_for_deleted() {
+        let start_node = insert_one_to_hundred();
+        for i in 25..=75 {
+            delete_value(i, Arc::clone(&start_node), false);
+        }
+        for i in 25..=75 {
+            let result_val = get_value(i, Arc::clone(&start_node));
+            assert_eq!(None, result_val);
+        }
+    }
+
+    #[test]
+    fn insert_three_delete_middle_search_for_both() {
+        let start_node = create_new_list();
+        for i in 1..=3 {
+            insert_value(i, vec![i as u8], Arc::clone(&start_node));
+        }
+        delete_value(2, Arc::clone(&start_node), false);
+        let result_val = get_value(2, Arc::clone(&start_node));
+        assert_eq!(None, result_val);
+
+        let result_val = get_value(1, Arc::clone(&start_node));
+        assert_eq!(Some(vec![1]), result_val);
+        let result_val = get_value(3, Arc::clone(&start_node));
+        assert_eq!(Some(vec![3]), result_val);
+    }
+
+    #[test]
+    fn manual_create_three_del_middle_search() {
+        let start_node = create_new_list();
+        let third = Arc::new(RwLock::new(SkipListNode {
+            key: 3,
+            value: Epitaph::Alive(vec![3]),
+            pointers: vec![None, None, None],
+            deleted: false,
+        }));
+        let second = Arc::new(RwLock::new(SkipListNode {
+            key: 2,
+            value: Epitaph::Alive(vec![2]),
+            pointers: vec![Some(Arc::clone(&third)), Some(Arc::clone(&third))],
+            deleted: false,
+        }));
+        let first = Arc::new(RwLock::new(SkipListNode {
+            key: 1,
+            value: Epitaph::Alive(vec![1]),
+            pointers: vec![Some(Arc::clone(&second))],
+            deleted: false,
+        }));
+        let mut w_latch = start_node.write().unwrap();
+        w_latch.pointers[0] = Some(Arc::clone(&first));
+        w_latch.pointers[1] = Some(Arc::clone(&second));
+        w_latch.pointers[2] = Some(Arc::clone(&third));
+        drop(w_latch);
+
+        delete_value(2, Arc::clone(&start_node), false);
+
+        let result_val = get_value(1, Arc::clone(&start_node));
+        assert_eq!(Some(vec![1]), result_val);
+        // let result_val = get_value(2, Arc::clone(&start_node));
+        // assert_eq!(None, result_val);
+        let result_val = get_value(3, Arc::clone(&start_node));
+        assert_eq!(Some(vec![3]), result_val);
+    }
+
+    #[test]
+    fn manual_create_three_del_middle_search_2() {
+        let start_node = create_new_list();
+        let third = Arc::new(RwLock::new(SkipListNode {
+            key: 3,
+            value: Epitaph::Alive(vec![3]),
+            pointers: vec![None],
+            deleted: false,
+        }));
+        let second = Arc::new(RwLock::new(SkipListNode {
+            key: 2,
+            value: Epitaph::Alive(vec![2]),
+            pointers: vec![Some(Arc::clone(&third))],
+            deleted: false,
+        }));
+        let first = Arc::new(RwLock::new(SkipListNode {
+            key: 1,
+            value: Epitaph::Alive(vec![1]),
+            pointers: vec![Some(Arc::clone(&second)), None],
+            deleted: false,
+        }));
+        let mut w_latch = start_node.write().unwrap();
+        w_latch.pointers[0] = Some(Arc::clone(&first));
+        w_latch.pointers[1] = Some(Arc::clone(&first));
+        drop(w_latch);
+
+        delete_value(2, Arc::clone(&start_node), false);
+
+        let result_val = get_value(1, Arc::clone(&start_node));
+        assert_eq!(Some(vec![1]), result_val);
+        let result_val = get_value(2, Arc::clone(&start_node));
+        assert_eq!(None, result_val);
+        let result_val = get_value(3, Arc::clone(&start_node));
+        assert_eq!(Some(vec![3]), result_val);
+    }
+
+    #[test]
+    fn manual_create_three_del_middle_search_3() {
+        let start_node = create_new_list();
+        let third = Arc::new(RwLock::new(SkipListNode {
+            key: 3,
+            value: Epitaph::Alive(vec![3]),
+            pointers: vec![None],
+            deleted: false,
+        }));
+        let second = Arc::new(RwLock::new(SkipListNode {
+            key: 2,
+            value: Epitaph::Alive(vec![2]),
+            pointers: vec![Some(Arc::clone(&third))],
+            deleted: false,
+        }));
+        let first = Arc::new(RwLock::new(SkipListNode {
+            key: 1,
+            value: Epitaph::Alive(vec![1]),
+            pointers: vec![Some(Arc::clone(&second))],
+            deleted: false,
+        }));
+        let mut w_latch = start_node.write().unwrap();
+        w_latch.pointers[0] = Some(Arc::clone(&first));
+        drop(w_latch);
+
+        delete_value(2, Arc::clone(&start_node), false);
+
+        let result_val = get_value(1, Arc::clone(&start_node));
+        assert_eq!(Some(vec![1]), result_val);
+        let result_val = get_value(2, Arc::clone(&start_node));
+        assert_eq!(None, result_val);
+        let result_val = get_value(3, Arc::clone(&start_node));
+        assert_eq!(Some(vec![3]), result_val);
+    }
+
+    fn insert_one_to_hundred() -> Arc<RwLock<SkipListNode>> {
+        let start_node = create_new_list();
+        for i in 1..=100 {
+            insert_value(
+                i,
+                ((i as u8)..105).into_iter().collect(),
+                Arc::clone(&start_node),
+            );
+        }
+        start_node
     }
 }
