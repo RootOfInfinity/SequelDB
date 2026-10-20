@@ -64,8 +64,7 @@ pub fn create_new_list() -> Arc<RwLock<SkipListNode>> {
 /// gather read locks.
 /// It will return None if the key was not found in the skiplist.
 pub fn get_value(key: Key, start_node: Arc<RwLock<SkipListNode>>) -> Option<DataValue> {
-    let key_location =
-        search_for_item_or_predecessors(key, start_node, std::array::from_fn(|_| None));
+    let key_location = search_for_item_or_predecessors(key, start_node);
     match key_location {
         KeyLocation::Exact(node) => {
             let read_latch = node.read().unwrap();
@@ -103,11 +102,7 @@ pub fn delete_value(
         insert_item(key, Epitaph::Tombstone, start_node);
         return Some(());
     } else {
-        let key_location = search_for_item_or_predecessors(
-            key,
-            Arc::clone(&start_node),
-            std::array::from_fn(|_| None),
-        );
+        let key_location = search_for_item_or_predecessors(key, Arc::clone(&start_node));
         match key_location {
             KeyLocation::Exact(node) => {
                 let level = node.read().unwrap().pointers.len() - 1;
@@ -129,36 +124,39 @@ pub fn delete_value(
 /// existed.
 fn search_for_item_or_predecessors(
     key: Key,
-    start_node: Arc<RwLock<SkipListNode>>,
-    mut possible_predecessors_by_level: [Option<Arc<RwLock<SkipListNode>>>; MAX_LEN as usize],
+    mut start_node: Arc<RwLock<SkipListNode>>,
 ) -> KeyLocation {
-    // Unwrap if the other threads panic.
-    let read_start = start_node.read().unwrap();
-    // Add self to metadata
-    let level = read_start.pointers.len() - 1;
-    possible_predecessors_by_level[level] = Some(Arc::clone(&start_node));
+    let mut possible_predecessors_by_level: [Option<Arc<RwLock<SkipListNode>>>; MAX_LEN as usize] =
+        std::array::from_fn(|_| None);
+    loop {
+        // Unwrap if the other threads panic.
+        let read_start = start_node.read().unwrap();
+        // Add self to metadata
+        let level = read_start.pointers.len() - 1;
+        possible_predecessors_by_level[level] = Some(Arc::clone(&start_node));
 
-    let mut next_node: Option<Arc<RwLock<SkipListNode>>> = None;
+        let mut next_node: Option<Arc<RwLock<SkipListNode>>> = None;
 
-    for node_option in read_start.pointers.iter().rev() {
-        if let Some(node) = node_option {
-            let new_node_read = node.read().unwrap();
-            if new_node_read.key == key && !new_node_read.deleted {
-                return KeyLocation::Exact(Arc::clone(&node));
-            } else if new_node_read.key < key {
-                next_node = Some(Arc::clone(&node));
-                break;
+        for node_option in read_start.pointers.iter().rev() {
+            if let Some(node) = node_option {
+                let new_node_read = node.read().unwrap();
+                if new_node_read.key == key && !new_node_read.deleted {
+                    return KeyLocation::Exact(Arc::clone(&node));
+                } else if new_node_read.key < key {
+                    next_node = Some(Arc::clone(&node));
+                    break;
+                }
             }
         }
-    }
-    drop(read_start);
-    match next_node {
-        Some(next_node) => {
-            search_for_item_or_predecessors(key, next_node, possible_predecessors_by_level)
-        }
-        None => {
-            let new_predecessors = refine_predecessors(possible_predecessors_by_level);
-            KeyLocation::Before(new_predecessors)
+        drop(read_start);
+        match next_node {
+            Some(next_node) => {
+                start_node = next_node;
+            }
+            None => {
+                let new_predecessors = refine_predecessors(possible_predecessors_by_level);
+                return KeyLocation::Before(new_predecessors);
+            }
         }
     }
 }
@@ -173,11 +171,7 @@ fn search_for_item_or_predecessors(
 /// Research and testing will show if this has the possiblility for deadlocks.
 fn insert_item(key: Key, value: Epitaph, start_node: Arc<RwLock<SkipListNode>>) {
     loop {
-        let key_location = search_for_item_or_predecessors(
-            key,
-            Arc::clone(&start_node),
-            std::array::from_fn(|_| None),
-        );
+        let key_location = search_for_item_or_predecessors(key, Arc::clone(&start_node));
         match key_location {
             KeyLocation::Exact(node) => {
                 let mut write_lock = node.write().unwrap();
@@ -247,11 +241,7 @@ fn delete_node(
     start_node: Arc<RwLock<SkipListNode>>,
 ) {
     node_to_kill.write().unwrap().deleted = true;
-    let key_location = search_for_item_or_predecessors(
-        key,
-        Arc::clone(&start_node),
-        std::array::from_fn(|_| None),
-    );
+    let key_location = search_for_item_or_predecessors(key, Arc::clone(&start_node));
     let KeyLocation::Before(mut predecessors_by_level) = key_location else {
         panic!(
             "Programming error, should not be able to insert where it would have a deleted node as a child"
@@ -277,11 +267,7 @@ fn delete_node(
                 w_latch.pointers[i] = Some(Arc::clone(&node_to_kill));
             }
             // get a new predecessor set
-            let key_location = search_for_item_or_predecessors(
-                key,
-                Arc::clone(&start_node),
-                std::array::from_fn(|_| None),
-            );
+            let key_location = search_for_item_or_predecessors(key, Arc::clone(&start_node));
             match key_location {
                 KeyLocation::Exact(_) => {
                     panic!(
@@ -363,6 +349,8 @@ fn skip_level() -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
 
     #[test]
@@ -609,5 +597,104 @@ mod tests {
             );
         }
         start_node
+    }
+
+    // Multithreaded Tests
+
+    #[test]
+    fn multithread_search_list() {
+        // yes, I know creating 100  threads is super inefficent
+        let start_node = insert_one_to_hundred();
+        let handles = (1..=100).into_iter().map(|i| {
+            let start_node_clone = Arc::clone(&start_node);
+            thread::spawn(move || {
+                let result_val = get_value(i, start_node_clone);
+                assert_eq!(Some(((i as u8)..105).into_iter().collect()), result_val);
+            })
+        });
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn multithread_search_list_reverse() {
+        // yes, I know creating 100  threads is super inefficent
+        let start_node = insert_one_to_hundred();
+        let handles = (1..=100).into_iter().rev().map(|i| {
+            let start_node_clone = Arc::clone(&start_node);
+            thread::spawn(move || {
+                let result_val = get_value(i, start_node_clone);
+                assert_eq!(Some(((i as u8)..105).into_iter().collect()), result_val);
+            })
+        });
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn multithread_search_list_middle_then_sides() {
+        // yes, I know creating 100  threads is super inefficent
+        let start_node = insert_one_to_hundred();
+        let handles = (26..=75)
+            .chain(1..=25)
+            .chain(76..=100)
+            .into_iter()
+            .map(|i| {
+                let start_node_clone = Arc::clone(&start_node);
+                thread::spawn(move || {
+                    let result_val = get_value(i, start_node_clone);
+                    assert_eq!(Some(((i as u8)..105).into_iter().collect()), result_val);
+                })
+            });
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
+
+    // keep getting stack overflow somehow
+    #[test]
+    fn multithread_create_list() {
+        for _ in 0..20 {
+            let start_node = create_new_list();
+            let start_node_1 = Arc::clone(&start_node);
+            let start_node_2 = Arc::clone(&start_node);
+            let start_node_3 = Arc::clone(&start_node);
+            let start_node_4 = Arc::clone(&start_node);
+            let handle1 = thread::spawn(move || {
+                for i in 1..=25 {
+                    insert_value(i, vec![i as u8], Arc::clone(&start_node_1));
+                }
+                let result_val = get_value(10, start_node_1);
+                assert_eq!(Some(vec![10]), result_val);
+            });
+            let handle2 = thread::spawn(move || {
+                for i in 26..=50 {
+                    insert_value(i, vec![i as u8], Arc::clone(&start_node_2));
+                }
+                let result_val = get_value(30, start_node_2);
+                assert_eq!(Some(vec![30]), result_val);
+            });
+            let handle3 = thread::spawn(move || {
+                for i in 51..=75 {
+                    insert_value(i, vec![i as u8], Arc::clone(&start_node_3));
+                }
+                let result_val = get_value(60, start_node_3);
+                assert_eq!(Some(vec![60]), result_val);
+            });
+            let handle4 = thread::spawn(move || {
+                for i in 76..=100 {
+                    insert_value(i, vec![i as u8], Arc::clone(&start_node_4));
+                }
+                let result_val = get_value(80, start_node_4);
+                assert_eq!(Some(vec![80]), result_val);
+            });
+            for i in 101..=125 {
+                insert_value(i, vec![i as u8], Arc::clone(&start_node));
+            }
+            let result_val = get_value(110, start_node);
+            assert_eq!(Some(vec![110]), result_val);
+        }
     }
 }
